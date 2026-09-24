@@ -26,7 +26,7 @@ This project monitors, protects, and telemeters parameters for a dual-battery pa
 | :--- | :---        | :--- |
 | **PA0** | ADC1_IN0    | Battery 1 Tap via Divider (100kΩ / 36kΩ) |
 | **PA1** | ADC1_IN1    | Total Pack Tap via Divider (223kΩ / 36kΩ) |
-| **PA4** | ADC1_IN4    | ACS712 Current Sensor Output (via 3×15kΩ Divider) |
+| **PA4** | ADC1_IN4    | ACS712 Current Sensor Output (via 15kΩ + 15kΩ Divider = 2.0x) |
 | **PA2** | USART2_TX   | ST-LINK Virtual COM Port TX (115200 Baud, 8N1) |
 | **PA3** | USART2_RX   | ST-LINK Virtual COM Port RX |
 
@@ -38,7 +38,7 @@ This project monitors, protects, and telemeters parameters for a dual-battery pa
   - $R_1 = 223\text{ k}\Omega$, $R_2 = 36\text{ k}\Omega$
   - Divider Ratio: $\approx 7.1944$
 - **ACS712-30A Sensor**:
-  - $3\times 15\text{ k}\Omega$ resistor network (3:1 ratio) to scale 0–5V sensor output into STM32 0–3.3V ADC range.
+  - $15\text{ k}\Omega + 15\text{ k}\Omega$ divider ($2:1$ ratio = $2.0000$) scaling 0–5V sensor output to 0–2.5V STM32 ADC range ($\approx 1.25\text{V} - 1.28\text{V}$ at 0A no-load).
 
 ---
 

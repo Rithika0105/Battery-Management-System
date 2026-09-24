@@ -16,7 +16,7 @@
   * ----------------------------------------------------------------------------
   * Battery 1 | 100 kOhm, 36 kOhm      | 3.7778| 12.000 V         | 3.176 V         | 3941 counts
   * Pack/Bat2 | 223 kOhm, 36 kOhm      | 7.1944| 24.000 V         | 3.336 V         | 4095 (Saturated)
-  * ACS712-30A| 15k + 15k, 15k (3-Res) | 3.0000| +/-30.00 A       | 1.493 V (+30A)  | 1853 counts
+  * ACS712-30A| 15 kOhm, 15 kOhm (2-Res)| 2.0000| +/-30.00 A       | 2.500 V (+30A)  | 3102 counts (~1.25V @ 0A)
   * ----------------------------------------------------------------------------
   *
   * Hardware Pin Mapping:
@@ -25,7 +25,7 @@
   * ----------------------------------------------------------------------------
   * PA0  | ADC1_IN0       | Battery 1 Tap (Node 1) via Divider (100k / 36k)
   * PA1  | ADC1_IN1       | Total Pack Tap (Node 2) via Divider (223k / 36k)
-  * PA4  | ADC1_IN4       | ACS712 OUT via 3x 15k Divider (15k+15k : 15k)
+  * PA4  | ADC1_IN4       | ACS712 OUT via 2x 15k Divider (15k : 15k = 2.0x, ~1.25V @ 0A)
   * PA2  | USART2_TX      | ST-LINK Virtual COM Port TX (115200 Baud, 8N1)
   * PA3  | USART2_RX      | ST-LINK Virtual COM Port RX
   * ----------------------------------------------------------------------------
@@ -68,26 +68,23 @@
 /* ACS712 30A Current Sensor Specifications */
 #define ACS712_SENSITIVITY       (0.066f)   /* 66 mV/A for 30A version (V/A) */
 #define ACS712_NOMINAL_ZERO_V    (2.500f)   /* Nominal 0A voltage at 5V VCC (V) */
-#define ACS712_R1                (15.0f)    /* Resistor 1: 15 kOhm */
-#define ACS712_R2                (15.0f)    /* Resistor 2: 15 kOhm */
-#define ACS712_R3                (15.0f)    /* Resistor 3: 15 kOhm */
-#define ACS712_DIV_RATIO         ((ACS712_R1 + ACS712_R2 + ACS712_R3) / ACS712_R3) /* 45/15 = 3.0000 */
-#define CURRENT_NOISE_DEADBAND   (0.050f)   /* 50 mA noise threshold */
-/* ============================================================================
- * CURRENT SENSOR (ACS712) CONFIGURATION
- * ============================================================================
- * Live measurement is ENABLED. The firmware automatically detects if the
- * sensor is plugged in:
- * - When plugged in (PA4 > 0.12V / > 150 counts): measures real-time current & power.
- * - When unplugged (PA4 < 0.12V / < 150 counts): displays 0.000 A [DISCONNECTED].
- * ============================================================================ */
+
+/* ACS712 Voltage Divider: 15k & 15k (2 Resistors to PA4)
+ * V_pin = V_sensor * (15k / (15k + 15k)) = V_sensor / 2.0
+ * At 0A no-load: V_sensor = ~2.568V -> V_pin = ~1.284V
+ * Ratio = (15k + 15k) / 15k = 2.0000 */
+#define ACS712_R1                (15.0f)    /* Upper Resistor: 15 kOhm */
+#define ACS712_R2                (15.0f)    /* Lower Resistor to GND: 15 kOhm */
+#define ACS712_DIV_RATIO         ((ACS712_R1 + ACS712_R2) / ACS712_R2) /* (15+15)/15 = 2.0000 */
+#define CURRENT_NOISE_DEADBAND   (0.080f)   /* 80 mA noise deadband */
+
 #define CURRENT_SENSOR_ATTACHED  (1)
 
 /* Disconnected ACS712 Threshold:
- * Quiescent 0A is ~1034 counts (0.833V with 3:1 divider).
- * Even under heavy -30A reverse current, V_pin is ~0.17V (~215 counts).
- * When disconnected or grounded, PA4 reads < 0.12V (< 150 counts). */
-#define ACS712_DISCONNECT_THRESHOLD (150U)  /* < 0.12V on PA4 pin -> Sensor Disconnected */
+ * At no-load: V_pin is ~1.25V - 1.28V (~1550 - 1600 counts).
+ * When disconnected from the 15k-15k divider, PA4 is pulled to GND (< 0.16V / < 200 counts).
+ * Any reading < 200 counts indicates SENSOR DISCONNECTED. */
+#define ACS712_DISCONNECT_THRESHOLD (200U)  /* < 0.16V on PA4 pin -> Sensor Disconnected */
 
 /* Battery Safety Limits */
 #define BAT1_MAX_LIMIT           (12.00f)   /* 12V Max for Battery 1 */
@@ -165,21 +162,21 @@ int main(void)
   UART_SendString("========================================================\r\n");
 
   /* Zero-Current Offset Auto-Calibration */
-  UART_SendString("[i] Checking ACS712 Current Sensor (PA4)...\r\n");
+  UART_SendString("[i] Calibrating ACS712 Current Sensor (PA4: 15k+15k Divider)...\r\n");
   BMS_CalibrateCurrentSensor(&bms_data);
 
   if (bms_data.current_sensor_connected)
   {
-    char cal_msg[80];
+    char cal_msg[96];
     char str_offset[16];
     Format_Float(str_offset, sizeof(str_offset), bms_data.v_zero_offset, 3);
-    snprintf(cal_msg, sizeof(cal_msg), "[OK] ACS712 Connected (RAW=%u)! Zero-Offset: %s V\r\n\r\n",
+    snprintf(cal_msg, sizeof(cal_msg), "[OK] ACS712 Calibrated (PA4=%u / ~1.28V)! Zero-Offset: %s V\r\n\r\n",
              bms_data.raw_adc4, str_offset);
     UART_SendString(cal_msg);
   }
   else
   {
-    UART_SendString("[i] ACS712 Sensor: NOT CONNECTED (PA4 < 0.12V) -> Current set to 0.000 A\r\n\r\n");
+    UART_SendString("[i] ACS712 Sensor: SENSOR DISCONNECTED (PA4 < 0.16V) -> Current set to 0.000 A\r\n\r\n");
   }
 
   uint32_t sample_counter = 0;
@@ -277,7 +274,7 @@ uint16_t BMS_ADC_ReadChannel(uint8_t channel)
 void BMS_CalibrateCurrentSensor(BMS_DualBattery_Data_t *bms)
 {
   uint32_t cal_accumulator = 0;
-  const uint32_t cal_samples = 64;
+  const uint32_t cal_samples = 128;
 
   for (uint32_t i = 0; i < cal_samples; i++)
   {
@@ -288,14 +285,14 @@ void BMS_CalibrateCurrentSensor(BMS_DualBattery_Data_t *bms)
   uint16_t avg_raw = (uint16_t)(cal_accumulator / cal_samples);
   bms->raw_adc4 = avg_raw;
 
-  /* Check if sensor is disconnected (pin < 150 counts = < 0.12V) */
+  /* Check if sensor is disconnected (pin < 200 counts = < 0.16V) */
   if (avg_raw < ACS712_DISCONNECT_THRESHOLD)
   {
     bms->current_sensor_connected = false;
     bms->v_zero_offset = ACS712_NOMINAL_ZERO_V;
     bms->current_amps = 0.0f;
     bms->power_watts = 0.0f;
-    strcpy(bms->current_state, "DISCONNECTED");
+    strcpy(bms->current_state, "SENSOR DISCONNECTED");
     return;
   }
 
@@ -303,7 +300,8 @@ void BMS_CalibrateCurrentSensor(BMS_DualBattery_Data_t *bms)
   float v_pin = ((float)avg_raw / ADC_MAX_COUNT) * VREF_VOLTAGE;
   bms->v_zero_offset = v_pin * ACS712_DIV_RATIO;
 
-  /* Sanity check: If zero offset is out of reasonable range (2.1V - 2.9V), fallback to 2.50V */
+  /* Sanity check: With 2.0x divider, ~1.25V - 1.30V at pin gives ~2.4V - 2.7V offset.
+   * If within 2.10V - 2.90V, accept calibrated offset; otherwise fallback to 2.50V */
   if (bms->v_zero_offset < 2.10f || bms->v_zero_offset > 2.90f)
   {
     bms->v_zero_offset = ACS712_NOMINAL_ZERO_V;
@@ -384,20 +382,25 @@ void BMS_ProcessSensors(BMS_DualBattery_Data_t *bms)
 
   if (bms->raw_adc4 < ACS712_DISCONNECT_THRESHOLD)
   {
-    /* Sensor NOT connected: Pin sitting at GND (< 0.12V) */
+    /* Sensor NOT connected: Pin sitting at GND (< 0.16V) */
     bms->current_amps = 0.0f;
     bms->power_watts = 0.0f;
     bms->current_sensor_connected = false;
-    strcpy(bms->current_state, "DISCONNECTED");
+    strcpy(bms->current_state, "SENSOR DISCONNECTED");
   }
   else
   {
-    bms->current_sensor_connected = true;
+    /* If sensor was previously disconnected and just got plugged in, capture zero offset */
+    if (!bms->current_sensor_connected)
+    {
+      bms->current_sensor_connected = true;
+      bms->v_zero_offset = bms->v_sensor_raw;
+    }
 
     /* Current formula: I = (V_sensor - V_zero) / Sensitivity */
     float raw_current = (bms->v_sensor_raw - bms->v_zero_offset) / ACS712_SENSITIVITY;
 
-    /* Apply Noise Deadband Filter */
+    /* Apply Noise Deadband Filter (80 mA) */
     if (fabsf(raw_current) < CURRENT_NOISE_DEADBAND)
     {
       bms->current_amps = 0.0f;
@@ -534,8 +537,8 @@ void BMS_PrintTelemetry(const BMS_DualBattery_Data_t *bms)
     snprintf(buffer, sizeof(buffer), " Instantaneous Power  : %s W\r\n", str_power);
     UART_SendString(buffer);
   } else {
-    UART_SendString(" Battery Current      : 0.000 A [DISCONNECTED]\r\n");
-    UART_SendString(" Instantaneous Power  : 0.000 W [DISCONNECTED]\r\n");
+    UART_SendString(" Battery Current      : 0.000 A [SENSOR DISCONNECTED]\r\n");
+    UART_SendString(" Instantaneous Power  : 0.000 W [SENSOR DISCONNECTED]\r\n");
   }
 
   /* 7. System Status (original format) */
