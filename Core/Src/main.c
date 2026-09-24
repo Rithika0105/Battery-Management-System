@@ -76,19 +76,18 @@
 /* ============================================================================
  * CURRENT SENSOR (ACS712) CONFIGURATION
  * ============================================================================
- * Set CURRENT_SENSOR_ATTACHED to:
- *   0 : Current sensor is NOT connected.
- *       Hard-forces Current = 0.000 A and Power = 0.000 W (No dummy/floating values).
- *       Configures PA4 as Input with Internal Pull-Down to GND.
- *   1 : Current sensor IS physically connected to PA4 via 3:1 resistor divider.
+ * Live measurement is ENABLED. The firmware automatically detects if the
+ * sensor is plugged in:
+ * - When plugged in (PA4 > 0.12V / > 150 counts): measures real-time current & power.
+ * - When unplugged (PA4 < 0.12V / < 150 counts): displays 0.000 A [DISCONNECTED].
  * ============================================================================ */
-#define CURRENT_SENSOR_ATTACHED  (0)
+#define CURRENT_SENSOR_ATTACHED  (1)
 
 /* Disconnected ACS712 Threshold:
- * Quiescent 0A is ~1034 counts (0.833V).
- * When disconnected and pulled down to GND, PA4 reads near 0V (< 250 counts).
- * Any reading < 250 counts indicates the current sensor is NOT connected. */
-#define ACS712_DISCONNECT_THRESHOLD (250U)  /* < 0.20V on PA4 pin -> Sensor Disconnected */
+ * Quiescent 0A is ~1034 counts (0.833V with 3:1 divider).
+ * Even under heavy -30A reverse current, V_pin is ~0.17V (~215 counts).
+ * When disconnected or grounded, PA4 reads < 0.12V (< 150 counts). */
+#define ACS712_DISCONNECT_THRESHOLD (150U)  /* < 0.12V on PA4 pin -> Sensor Disconnected */
 
 /* Battery Safety Limits */
 #define BAT1_MAX_LIMIT           (12.00f)   /* 12V Max for Battery 1 */
@@ -171,15 +170,16 @@ int main(void)
 
   if (bms_data.current_sensor_connected)
   {
-    char cal_msg[64];
+    char cal_msg[80];
     char str_offset[16];
     Format_Float(str_offset, sizeof(str_offset), bms_data.v_zero_offset, 3);
-    snprintf(cal_msg, sizeof(cal_msg), "[OK] ACS712 Detected & Calibrated Zero-Offset: %s V\r\n\r\n", str_offset);
+    snprintf(cal_msg, sizeof(cal_msg), "[OK] ACS712 Connected (RAW=%u)! Zero-Offset: %s V\r\n\r\n",
+             bms_data.raw_adc4, str_offset);
     UART_SendString(cal_msg);
   }
   else
   {
-    UART_SendString("[i] ACS712 Sensor: NOT CONNECTED (Internal Pull-Down to GND Active -> 0.000 A)\r\n\r\n");
+    UART_SendString("[i] ACS712 Sensor: NOT CONNECTED (PA4 < 0.12V) -> Current set to 0.000 A\r\n\r\n");
   }
 
   uint32_t sample_counter = 0;
@@ -215,24 +215,9 @@ void BMS_ADC_Init(void)
   RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
   RCC->APB2ENR |= RCC_APB2ENR_ADC1EN;
 
-  /* 2. Configure PA0 and PA1 in Analog Mode (0b11) */
-  GPIOA->MODER |= (0x3UL << (0 * 2)) | (0x3UL << (1 * 2));
-  GPIOA->PUPDR &= ~((0x3UL << (0 * 2)) | (0x3UL << (1 * 2)));
-
-#if (CURRENT_SENSOR_ATTACHED == 1)
-  /* Sensor connected: Configure PA4 in Analog Mode */
-  GPIOA->MODER |= (0x3UL << (4 * 2));
-  GPIOA->PUPDR &= ~(0x3UL << (4 * 2));
-#else
-  /* Sensor NOT connected:
-   * In STM32F4, Analog mode (MODER=11) disconnects internal pull-up/pull-down resistors!
-   * Setting Input mode (MODER=00) with Pull-Down (PUPDR=10) physically engages
-   * the internal 40 kOhm pull-down resistor to GND, holding the unconnected pin at 0.00V!
-   */
-  GPIOA->MODER &= ~(0x3UL << (4 * 2)); /* Input Mode (0b00) */
-  GPIOA->PUPDR &= ~(0x3UL << (4 * 2));
-  GPIOA->PUPDR |=  (0x2UL << (4 * 2)); /* Internal Pull-Down to GND (0b10) */
-#endif
+  /* 2. Configure PA0, PA1, and PA4 in Analog Mode (0b11) */
+  GPIOA->MODER |= (0x3UL << (0 * 2)) | (0x3UL << (1 * 2)) | (0x3UL << (4 * 2));
+  GPIOA->PUPDR &= ~((0x3UL << (0 * 2)) | (0x3UL << (1 * 2)) | (0x3UL << (4 * 2)));
 
   /* 3. Set ADC Prescaler: PCLK2 / 4 */
   ADC->CCR &= ~ADC_CCR_ADCPRE;
@@ -291,15 +276,6 @@ uint16_t BMS_ADC_ReadChannel(uint8_t channel)
   */
 void BMS_CalibrateCurrentSensor(BMS_DualBattery_Data_t *bms)
 {
-#if (CURRENT_SENSOR_ATTACHED == 0)
-  /* Current sensor not present: disable and bypass calibration */
-  bms->current_sensor_connected = false;
-  bms->v_zero_offset = ACS712_NOMINAL_ZERO_V;
-  bms->current_amps = 0.0f;
-  bms->power_watts = 0.0f;
-  strcpy(bms->current_state, "DISCONNECTED");
-  return;
-#else
   uint32_t cal_accumulator = 0;
   const uint32_t cal_samples = 64;
 
@@ -310,8 +286,9 @@ void BMS_CalibrateCurrentSensor(BMS_DualBattery_Data_t *bms)
   }
 
   uint16_t avg_raw = (uint16_t)(cal_accumulator / cal_samples);
+  bms->raw_adc4 = avg_raw;
 
-  /* Check if sensor is disconnected (pin pulled down to GND < 250 counts) */
+  /* Check if sensor is disconnected (pin < 150 counts = < 0.12V) */
   if (avg_raw < ACS712_DISCONNECT_THRESHOLD)
   {
     bms->current_sensor_connected = false;
@@ -326,12 +303,11 @@ void BMS_CalibrateCurrentSensor(BMS_DualBattery_Data_t *bms)
   float v_pin = ((float)avg_raw / ADC_MAX_COUNT) * VREF_VOLTAGE;
   bms->v_zero_offset = v_pin * ACS712_DIV_RATIO;
 
-  /* Sanity check: If zero offset is out of range, fallback to 2.50V */
-  if (bms->v_zero_offset < 2.20f || bms->v_zero_offset > 2.80f)
+  /* Sanity check: If zero offset is out of reasonable range (2.1V - 2.9V), fallback to 2.50V */
+  if (bms->v_zero_offset < 2.10f || bms->v_zero_offset > 2.90f)
   {
     bms->v_zero_offset = ACS712_NOMINAL_ZERO_V;
   }
-#endif
 }
 
 /**
@@ -402,22 +378,13 @@ void BMS_ProcessSensors(BMS_DualBattery_Data_t *bms)
   }
 
   /* 6. Process ACS712 Current Sensor (PA4) */
-#if (CURRENT_SENSOR_ATTACHED == 0)
-  /* Current sensor is NOT connected: force strictly 0.000 A and 0.000 W */
   bms->raw_adc4 = BMS_ADC_ReadChannel(4);
-  bms->v_adc4 = 0.0f;
-  bms->v_sensor_raw = 0.0f;
-  bms->current_amps = 0.0f;
-  bms->power_watts = 0.0f;
-  bms->current_sensor_connected = false;
-  strcpy(bms->current_state, "DISCONNECTED");
-#else
-  bms->raw_adc4 = BMS_ADC_ReadChannel(4);
+  bms->v_adc4 = ((float)bms->raw_adc4 / ADC_MAX_COUNT) * VREF_VOLTAGE;
+  bms->v_sensor_raw = bms->v_adc4 * ACS712_DIV_RATIO;
+
   if (bms->raw_adc4 < ACS712_DISCONNECT_THRESHOLD)
   {
-    /* Sensor NOT connected: Pin pulled down to GND (0V) */
-    bms->v_adc4 = 0.0f;
-    bms->v_sensor_raw = 0.0f;
+    /* Sensor NOT connected: Pin sitting at GND (< 0.12V) */
     bms->current_amps = 0.0f;
     bms->power_watts = 0.0f;
     bms->current_sensor_connected = false;
@@ -426,8 +393,6 @@ void BMS_ProcessSensors(BMS_DualBattery_Data_t *bms)
   else
   {
     bms->current_sensor_connected = true;
-    bms->v_adc4 = ((float)bms->raw_adc4 / ADC_MAX_COUNT) * VREF_VOLTAGE;
-    bms->v_sensor_raw = bms->v_adc4 * ACS712_DIV_RATIO;
 
     /* Current formula: I = (V_sensor - V_zero) / Sensitivity */
     float raw_current = (bms->v_sensor_raw - bms->v_zero_offset) / ACS712_SENSITIVITY;
@@ -461,7 +426,6 @@ void BMS_ProcessSensors(BMS_DualBattery_Data_t *bms)
       bms->power_watts = 0.0f;
     }
   }
-#endif
 }
 
 /**
@@ -531,8 +495,10 @@ void BMS_PrintTelemetry(const BMS_DualBattery_Data_t *bms)
   UART_SendString(buffer);
 
   /* 2. Divider Vout Pin Voltages */
-  snprintf(buffer, sizeof(buffer), " Divider Vout (Pins)  : Vout1(PA0) = %s V | Vout2(PA1) = %s V\r\n",
-           str_vadc0, str_vadc1);
+  char str_vadc4[16];
+  Format_Float(str_vadc4, sizeof(str_vadc4), bms->v_adc4, 3);
+  snprintf(buffer, sizeof(buffer), " Divider Vout (Pins)  : Vout1(PA0) = %s V | Vout2(PA1) = %s V | PA4_CS = %s V\r\n",
+           str_vadc0, str_vadc1, str_vadc4);
   UART_SendString(buffer);
 
   /* 3. Battery 1 Voltage (original format) */
