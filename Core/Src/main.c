@@ -71,12 +71,13 @@
 
 /* ACS712 Voltage Divider: 15k & 15k (2 Resistors to PA4)
  * V_pin = V_sensor * (15k / (15k + 15k)) = V_sensor / 2.0
- * At 0A no-load: V_sensor = ~2.568V -> V_pin = ~1.284V
+ * At 0A no-load: PA4 reads 1.256V -> V_sensor = 2.512V
  * Ratio = (15k + 15k) / 15k = 2.0000 */
 #define ACS712_R1                (15.0f)    /* Upper Resistor: 15 kOhm */
 #define ACS712_R2                (15.0f)    /* Lower Resistor to GND: 15 kOhm */
 #define ACS712_DIV_RATIO         ((ACS712_R1 + ACS712_R2) / ACS712_R2) /* (15+15)/15 = 2.0000 */
-#define CURRENT_NOISE_DEADBAND   (0.080f)   /* 80 mA noise deadband */
+#define ACS712_NO_LOAD_ZERO_V    (2.512f)   /* Calibrated 0A voltage: 1.256V * 2.0 = 2.512V */
+#define CURRENT_NOISE_DEADBAND   (0.150f)   /* 150 mA noise deadband to ensure clean 0.000A in idle */
 
 #define CURRENT_SENSOR_ATTACHED  (1)
 
@@ -162,7 +163,7 @@ int main(void)
   UART_SendString("========================================================\r\n");
 
   /* Zero-Current Offset Auto-Calibration */
-  UART_SendString("[i] Calibrating ACS712 Current Sensor (PA4: 15k+15k Divider)...\r\n");
+  UART_SendString("[i] Calibrating ACS712 Current Sensor Zero Offset (PA4 @ ~1.256V)...\r\n");
   BMS_CalibrateCurrentSensor(&bms_data);
 
   if (bms_data.current_sensor_connected)
@@ -170,7 +171,7 @@ int main(void)
     char cal_msg[96];
     char str_offset[16];
     Format_Float(str_offset, sizeof(str_offset), bms_data.v_zero_offset, 3);
-    snprintf(cal_msg, sizeof(cal_msg), "[OK] ACS712 Calibrated (PA4=%u / ~1.28V)! Zero-Offset: %s V\r\n\r\n",
+    snprintf(cal_msg, sizeof(cal_msg), "[OK] ACS712 Calibrated (PA4=%u / 1.256V)! Zero-Offset: %s V\r\n\r\n",
              bms_data.raw_adc4, str_offset);
     UART_SendString(cal_msg);
   }
@@ -273,8 +274,14 @@ uint16_t BMS_ADC_ReadChannel(uint8_t channel)
   */
 void BMS_CalibrateCurrentSensor(BMS_DualBattery_Data_t *bms)
 {
+  /* Discard first few conversion cycles to let ADC settle */
+  for (volatile int d = 0; d < 10; d++) {
+    (void)BMS_ADC_ReadChannel(4);
+    HAL_Delay(5);
+  }
+
   uint32_t cal_accumulator = 0;
-  const uint32_t cal_samples = 128;
+  const uint32_t cal_samples = 256;
 
   for (uint32_t i = 0; i < cal_samples; i++)
   {
@@ -289,7 +296,7 @@ void BMS_CalibrateCurrentSensor(BMS_DualBattery_Data_t *bms)
   if (avg_raw < ACS712_DISCONNECT_THRESHOLD)
   {
     bms->current_sensor_connected = false;
-    bms->v_zero_offset = ACS712_NOMINAL_ZERO_V;
+    bms->v_zero_offset = ACS712_NO_LOAD_ZERO_V;
     bms->current_amps = 0.0f;
     bms->power_watts = 0.0f;
     strcpy(bms->current_state, "SENSOR DISCONNECTED");
@@ -300,11 +307,11 @@ void BMS_CalibrateCurrentSensor(BMS_DualBattery_Data_t *bms)
   float v_pin = ((float)avg_raw / ADC_MAX_COUNT) * VREF_VOLTAGE;
   bms->v_zero_offset = v_pin * ACS712_DIV_RATIO;
 
-  /* Sanity check: With 2.0x divider, ~1.25V - 1.30V at pin gives ~2.4V - 2.7V offset.
-   * If within 2.10V - 2.90V, accept calibrated offset; otherwise fallback to 2.50V */
-  if (bms->v_zero_offset < 2.10f || bms->v_zero_offset > 2.90f)
+  /* Sanity check: With 2.0x divider, ~1.25V at pin gives ~2.51V offset.
+   * If within 2.30V - 2.70V, accept calibrated offset; otherwise fallback to 2.512V */
+  if (bms->v_zero_offset < 2.30f || bms->v_zero_offset > 2.70f)
   {
-    bms->v_zero_offset = ACS712_NOMINAL_ZERO_V;
+    bms->v_zero_offset = ACS712_NO_LOAD_ZERO_V;
   }
 }
 
@@ -390,17 +397,17 @@ void BMS_ProcessSensors(BMS_DualBattery_Data_t *bms)
   }
   else
   {
-    /* If sensor was previously disconnected and just got plugged in, capture zero offset */
+    /* If sensor was previously disconnected and just got plugged in, calibrate */
     if (!bms->current_sensor_connected)
     {
-      bms->current_sensor_connected = true;
-      bms->v_zero_offset = bms->v_sensor_raw;
+      HAL_Delay(50); /* Debounce contact */
+      BMS_CalibrateCurrentSensor(bms);
     }
 
     /* Current formula: I = (V_sensor - V_zero) / Sensitivity */
     float raw_current = (bms->v_sensor_raw - bms->v_zero_offset) / ACS712_SENSITIVITY;
 
-    /* Apply Noise Deadband Filter (80 mA) */
+    /* Apply Noise Deadband Filter (150 mA) */
     if (fabsf(raw_current) < CURRENT_NOISE_DEADBAND)
     {
       bms->current_amps = 0.0f;
@@ -420,7 +427,7 @@ void BMS_ProcessSensors(BMS_DualBattery_Data_t *bms)
     }
 
     /* 7. Calculate Instantaneous Power: P = V_pack * I (Watts) */
-    if (bms->pack_connected)
+    if (bms->pack_connected && (fabsf(bms->current_amps) > 0.0f))
     {
       bms->power_watts = bms->v_pack * bms->current_amps;
     }
