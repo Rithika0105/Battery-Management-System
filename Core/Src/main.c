@@ -73,6 +73,11 @@
 #define ACS712_R3                (15.0f)    /* Resistor 3: 15 kOhm */
 #define ACS712_DIV_RATIO         ((ACS712_R1 + ACS712_R2 + ACS712_R3) / ACS712_R3) /* 45/15 = 3.0000 */
 #define CURRENT_NOISE_DEADBAND   (0.050f)   /* 50 mA noise threshold */
+/* Disconnected ACS712 Threshold:
+ * Quiescent 0A is ~1034 counts (0.833V).
+ * When disconnected and pulled down to GND, PA4 reads near 0V (< 250 counts).
+ * Any reading < 250 counts indicates the current sensor is NOT connected. */
+#define ACS712_DISCONNECT_THRESHOLD (250U)  /* < 0.20V on PA4 pin -> Sensor Disconnected */
 
 /* Battery Safety Limits */
 #define BAT1_MAX_LIMIT           (12.00f)   /* 12V Max for Battery 1 */
@@ -106,7 +111,8 @@ typedef struct {
   float    v_zero_offset;       /* Calibrated Zero-Current Sensor Offset (V) */
   float    current_amps;        /* Measured Battery Current (+ Discharging, - Charging) (A) */
   float    power_watts;         /* Instantaneous Battery Power = V_pack * Current (W) */
-  char     current_state[16];   /* "CHARGING", "DISCHARGING", "IDLE" */
+  char     current_state[16];   /* "CHARGING", "DISCHARGING", "IDLE", "DISCONNECTED" */
+  bool     current_sensor_connected; /* True if ACS712 is physically connected */
 } BMS_DualBattery_Data_t;
 
 BMS_DualBattery_Data_t bms_data;
@@ -149,14 +155,21 @@ int main(void)
   UART_SendString("========================================================\r\n");
 
   /* Zero-Current Offset Auto-Calibration */
-  UART_SendString("[i] Calibrating ACS712 Current Sensor Zero Offset (Ensure 0A Load)...\r\n");
+  UART_SendString("[i] Checking ACS712 Current Sensor (PA4)...\r\n");
   BMS_CalibrateCurrentSensor(&bms_data);
 
-  char cal_msg[64];
-  char str_offset[16];
-  Format_Float(str_offset, sizeof(str_offset), bms_data.v_zero_offset, 3);
-  snprintf(cal_msg, sizeof(cal_msg), "[OK] ACS712 Calibrated Zero-Offset: %s V\r\n\r\n", str_offset);
-  UART_SendString(cal_msg);
+  if (bms_data.current_sensor_connected)
+  {
+    char cal_msg[64];
+    char str_offset[16];
+    Format_Float(str_offset, sizeof(str_offset), bms_data.v_zero_offset, 3);
+    snprintf(cal_msg, sizeof(cal_msg), "[OK] ACS712 Detected & Calibrated Zero-Offset: %s V\r\n\r\n", str_offset);
+    UART_SendString(cal_msg);
+  }
+  else
+  {
+    UART_SendString("[i] ACS712 Sensor: NOT CONNECTED (Internal Pull-Down to GND Active -> 0.000 A)\r\n\r\n");
+  }
 
   uint32_t sample_counter = 0;
 
@@ -193,7 +206,13 @@ void BMS_ADC_Init(void)
 
   /* 2. Configure PA0, PA1, and PA4 in Analog Mode (0b11) */
   GPIOA->MODER |= (0x3UL << (0 * 2)) | (0x3UL << (1 * 2)) | (0x3UL << (4 * 2));
+  
+  /* Configure PUPDR:
+   * PA0, PA1: No pull-up/pull-down (already pulled to ground via external resistor dividers)
+   * PA4: Internal Pull-Down (0b10) to GND to firmly ground pin and prevent floating when unplugged
+   */
   GPIOA->PUPDR &= ~((0x3UL << (0 * 2)) | (0x3UL << (1 * 2)) | (0x3UL << (4 * 2)));
+  GPIOA->PUPDR |=  (0x2UL << (4 * 2)); /* PA4 = Internal Pull-Down */
 
   /* 3. Set ADC Prescaler: PCLK2 / 4 */
   ADC->CCR &= ~ADC_CCR_ADCPRE;
@@ -253,7 +272,7 @@ uint16_t BMS_ADC_ReadChannel(uint8_t channel)
 void BMS_CalibrateCurrentSensor(BMS_DualBattery_Data_t *bms)
 {
   uint32_t cal_accumulator = 0;
-  const uint32_t cal_samples = 256;
+  const uint32_t cal_samples = 64;
 
   for (uint32_t i = 0; i < cal_samples; i++)
   {
@@ -262,6 +281,19 @@ void BMS_CalibrateCurrentSensor(BMS_DualBattery_Data_t *bms)
   }
 
   uint16_t avg_raw = (uint16_t)(cal_accumulator / cal_samples);
+
+  /* Check if sensor is disconnected (pin pulled down to GND < 250 counts) */
+  if (avg_raw < ACS712_DISCONNECT_THRESHOLD)
+  {
+    bms->current_sensor_connected = false;
+    bms->v_zero_offset = ACS712_NOMINAL_ZERO_V;
+    bms->current_amps = 0.0f;
+    bms->power_watts = 0.0f;
+    strcpy(bms->current_state, "DISCONNECTED");
+    return;
+  }
+
+  bms->current_sensor_connected = true;
   float v_pin = ((float)avg_raw / ADC_MAX_COUNT) * VREF_VOLTAGE;
   bms->v_zero_offset = v_pin * ACS712_DIV_RATIO;
 
@@ -340,39 +372,53 @@ void BMS_ProcessSensors(BMS_DualBattery_Data_t *bms)
   }
 
   /* 6. Process ACS712 Current Sensor (PA4) */
-  bms->v_adc4 = ((float)bms->raw_adc4 / ADC_MAX_COUNT) * VREF_VOLTAGE;
-  bms->v_sensor_raw = bms->v_adc4 * ACS712_DIV_RATIO;
-
-  /* Current formula: I = (V_sensor - V_zero) / Sensitivity */
-  float raw_current = (bms->v_sensor_raw - bms->v_zero_offset) / ACS712_SENSITIVITY;
-
-  /* Apply Noise Deadband Filter */
-  if (fabsf(raw_current) < CURRENT_NOISE_DEADBAND)
+  if (bms->raw_adc4 < ACS712_DISCONNECT_THRESHOLD)
   {
+    /* Sensor NOT connected: Pin pulled down to GND (0V) */
+    bms->v_adc4 = 0.0f;
+    bms->v_sensor_raw = 0.0f;
     bms->current_amps = 0.0f;
-    strcpy(bms->current_state, "IDLE");
+    bms->power_watts = 0.0f;
+    bms->current_sensor_connected = false;
+    strcpy(bms->current_state, "DISCONNECTED");
   }
   else
   {
-    bms->current_amps = raw_current;
-    if (bms->current_amps > 0.0f)
+    bms->current_sensor_connected = true;
+    bms->v_adc4 = ((float)bms->raw_adc4 / ADC_MAX_COUNT) * VREF_VOLTAGE;
+    bms->v_sensor_raw = bms->v_adc4 * ACS712_DIV_RATIO;
+
+    /* Current formula: I = (V_sensor - V_zero) / Sensitivity */
+    float raw_current = (bms->v_sensor_raw - bms->v_zero_offset) / ACS712_SENSITIVITY;
+
+    /* Apply Noise Deadband Filter */
+    if (fabsf(raw_current) < CURRENT_NOISE_DEADBAND)
     {
-      strcpy(bms->current_state, "DISCHARGING");
+      bms->current_amps = 0.0f;
+      strcpy(bms->current_state, "IDLE");
     }
     else
     {
-      strcpy(bms->current_state, "CHARGING");
+      bms->current_amps = raw_current;
+      if (bms->current_amps > 0.0f)
+      {
+        strcpy(bms->current_state, "DISCHARGING");
+      }
+      else
+      {
+        strcpy(bms->current_state, "CHARGING");
+      }
     }
-  }
 
-  /* 7. Calculate Instantaneous Power: P = V_pack * I (Watts) */
-  if (bms->pack_connected)
-  {
-    bms->power_watts = bms->v_pack * bms->current_amps;
-  }
-  else
-  {
-    bms->power_watts = 0.0f;
+    /* 7. Calculate Instantaneous Power: P = V_pack * I (Watts) */
+    if (bms->pack_connected)
+    {
+      bms->power_watts = bms->v_pack * bms->current_amps;
+    }
+    else
+    {
+      bms->power_watts = 0.0f;
+    }
   }
 }
 
@@ -473,11 +519,16 @@ void BMS_PrintTelemetry(const BMS_DualBattery_Data_t *bms)
   UART_SendString(buffer);
 
   /* 6. ADDED: Current & Power from ACS712 (after Cell Imbalance) */
-  snprintf(buffer, sizeof(buffer), " Battery Current      : %s A [%s]\r\n", str_curr, bms->current_state);
-  UART_SendString(buffer);
+  if (bms->current_sensor_connected) {
+    snprintf(buffer, sizeof(buffer), " Battery Current      : %s A [%s]\r\n", str_curr, bms->current_state);
+    UART_SendString(buffer);
 
-  snprintf(buffer, sizeof(buffer), " Instantaneous Power  : %s W\r\n", str_power);
-  UART_SendString(buffer);
+    snprintf(buffer, sizeof(buffer), " Instantaneous Power  : %s W\r\n", str_power);
+    UART_SendString(buffer);
+  } else {
+    UART_SendString(" Battery Current      : 0.000 A [DISCONNECTED]\r\n");
+    UART_SendString(" Instantaneous Power  : 0.000 W [DISCONNECTED]\r\n");
+  }
 
   /* 7. System Status (original format) */
   UART_SendString(" System Status        : ");
