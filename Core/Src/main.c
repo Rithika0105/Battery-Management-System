@@ -36,6 +36,9 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "stm32f4xx.h"
+#include "bms_ui.h"
+#include "edf_scheduler.h"
+#include "bms_safety.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
@@ -87,41 +90,14 @@
  * Any reading < 200 counts indicates SENSOR DISCONNECTED. */
 #define ACS712_DISCONNECT_THRESHOLD (200U)  /* < 0.16V on PA4 pin -> Sensor Disconnected */
 
-/* Battery Safety Limits */
-#define BAT1_MAX_LIMIT           (12.00f)   /* 12V Max for Battery 1 */
-#define BAT1_MIN_LIMIT           (8.40f)    /* 8.4V Cutoff */
-#define PACK_MAX_LIMIT           (24.00f)   /* 24V Max for Total Pack */
-#define PACK_MIN_LIMIT           (16.80f)   /* 16.8V Cutoff */
-#define CURRENT_MAX_LIMIT        (30.00f)   /* 30A Maximum Current Limit */
+/* DHT11 Temperature & Humidity Sensor Status Codes */
+#define DHT11_OK                 (0)
+#define DHT11_ERR_NO_RESPONSE    (1)
+#define DHT11_ERR_CHECKSUM       (2)
+#define DHT11_ERR_TIMEOUT        (3)
 
 /* Private variables ---------------------------------------------------------*/
 UART_HandleTypeDef huart2;
-
-typedef struct {
-  /* Voltage Channels */
-  uint16_t raw_adc0;            /* Raw ADC Count for PA0 (Battery 1) */
-  uint16_t raw_adc1;            /* Raw ADC Count for PA1 (Total Pack) */
-  float    v_adc0;              /* Measured Voltage at PA0 Pin (Vout1) */
-  float    v_adc1;              /* Measured Voltage at PA1 Pin (Vout2) */
-  float    v_bat1;              /* Measured Battery 1 Voltage (V) */
-  float    v_pack;              /* Measured Total Series-Pack Voltage (V) */
-  float    v_bat2;              /* Calculated Battery 2 Voltage = V_pack - V_bat1 (V) */
-  float    v_imbalance;         /* Imbalance = |V_bat1 - V_bat2| (V) */
-  bool     bat1_connected;      /* True if Battery 1 is connected */
-  bool     pack_connected;      /* True if Pack is connected */
-  bool     adc0_saturated;      /* True if PA0 is near/at saturation (>3.28V) */
-  bool     adc1_saturated;      /* True if PA1 is near/at saturation (>3.28V) */
-
-  /* Current & Power Channels */
-  uint16_t raw_adc4;            /* Raw ADC Count for PA4 (ACS712 Current) */
-  float    v_adc4;              /* Measured Voltage at PA4 Pin (V) */
-  float    v_sensor_raw;        /* Reconstructed ACS712 OUT Voltage (V) */
-  float    v_zero_offset;       /* Calibrated Zero-Current Sensor Offset (V) */
-  float    current_amps;        /* Measured Battery Current (+ Discharging, - Charging) (A) */
-  float    power_watts;         /* Instantaneous Battery Power = V_pack * Current (W) */
-  char     current_state[16];   /* "CHARGING", "DISCHARGING", "IDLE", "DISCONNECTED" */
-  bool     current_sensor_connected; /* True if ACS712 is physically connected */
-} BMS_DualBattery_Data_t;
 
 BMS_DualBattery_Data_t bms_data;
 
@@ -129,6 +105,10 @@ BMS_DualBattery_Data_t bms_data;
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
+static void DWT_Delay_Init(void);
+static void delay_us(uint32_t us);
+void DHT11_Init(void);
+uint8_t DHT11_Read(float *temperature, float *humidity);
 void BMS_ADC_Init(void);
 uint16_t BMS_ADC_ReadChannel(uint8_t channel);
 void BMS_CalibrateCurrentSensor(BMS_DualBattery_Data_t *bms);
@@ -156,10 +136,22 @@ int main(void)
   /* Initialize ADC1 for Multi-Channel Reading (PA0, PA1 & PA4) */
   BMS_ADC_Init();
 
+  /* Initialize DWT High-Resolution Microsecond Timer */
+  DWT_Delay_Init();
+
+  /* Initialize DHT11 Temperature & Humidity Sensor (PB0 with Internal Pull-up) */
+  DHT11_Init();
+
+  /* Initialize Safety Guard & Isolation Relay (PA8 Active HIGH) */
+  BMS_Safety_Init();
+
+  /* Initialize ST7735 1.8" SPI TFT LCD Display & Draw Dashboard */
+  BMS_UI_Init();
+
   /* Welcome Banner */
   UART_SendString("\r\n========================================================\r\n");
-  UART_SendString(" STM32F411RE Nucleo - Dual Battery & Current BMS Engine \r\n");
-  UART_SendString(" 12V/24V Dual Pack | ACS712 30A Sensor | UART Telemetry \r\n");
+  UART_SendString(" STM32F411RE Dual-Battery BMS - Hybrid EDF FreeRTOS Engine\r\n");
+  UART_SendString(" 3-Task EDF Scheduler | 3-Stage Safety | Coulomb Counting\r\n");
   UART_SendString("========================================================\r\n");
 
   /* Zero-Current Offset Auto-Calibration */
@@ -180,27 +172,194 @@ int main(void)
     UART_SendString("[i] ACS712 Sensor: SENSOR DISCONNECTED (PA4 < 0.16V) -> Current set to 0.000 A\r\n\r\n");
   }
 
-  uint32_t sample_counter = 0;
+  /* Initialize Hybrid Earliest Deadline First (EDF) Real-Time Kernel */
+  UART_SendString("[i] Starting Hybrid EDF Real-Time Scheduler with 3 Periodic Tasks...\r\n");
+  UART_SendString("    - Task 1: vSensorTask      (Period: 50ms,  Deadline: 50ms)\r\n");
+  UART_SendString("    - Task 2: vDashboardTask   (Period: 500ms, Deadline: 500ms)\r\n");
+  UART_SendString("    - Task 3: vSafetyGuardTask (Period: 10ms,  Deadline: 10ms)\r\n\r\n");
 
-  /* Main Infinite Loop */
+  EDF_Scheduler_Init();
+
+  /* Create the 3 Tasks */
+  xSensorTaskHandle      = EDF_TaskCreate("vSensorTask",      vSensorTask,      50,  50);
+  xDashboardTaskHandle   = EDF_TaskCreate("vDashboardTask",   vDashboardTask,   500, 500);
+  xSafetyGuardTaskHandle = EDF_TaskCreate("vSafetyGuardTask", vSafetyGuardTask, 10,  10);
+
+  /* Start Hybrid EDF Kernel Dispatcher (Never returns) */
+  EDF_Scheduler_Run();
+
+  /* Fallback loop */
   while (1)
   {
-    /* 1. Acquire, filter, and calculate all voltages, currents & power */
-    BMS_ProcessSensors(&bms_data);
-
-    /* 2. Format and Transmit Telemetry over UART */
-    sample_counter++;
-    UART_SendString("--- [BMS SAMPLE #");
-    char count_str[16];
-    snprintf(count_str, sizeof(count_str), "%lu", (unsigned long)sample_counter);
-    UART_SendString(count_str);
-    UART_SendString("] -----------------------------------\r\n");
-
-    BMS_PrintTelemetry(&bms_data);
-
-    /* 3. Telemetry Interval: 1000 ms (1 Hz Refresh Rate) */
-    HAL_Delay(1000);
   }
+}
+
+/**
+  * @brief  Initialize DWT (Data Watchpoint and Trace) cycle counter for accurate us delays
+  * @retval None
+  */
+static void DWT_Delay_Init(void)
+{
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT = 0;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+}
+
+/**
+  * @brief  Sub-microsecond accurate busy-wait delay using ARM Cortex-M4 DWT CYCCNT
+  * @param  us: Microseconds to delay
+  * @retval None
+  */
+static void delay_us(uint32_t us)
+{
+  uint32_t start_tick = DWT->CYCCNT;
+  uint32_t ticks = us * (SystemCoreClock / 1000000U);
+  while ((DWT->CYCCNT - start_tick) < ticks);
+}
+
+/**
+  * @brief  Initialize DHT11 Data GPIO Pin with Internal Pull-Up
+  * @retval None
+  */
+void DHT11_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  GPIO_InitStruct.Pin = DHT11_PIN;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(DHT11_PORT, &GPIO_InitStruct);
+}
+
+/**
+  * @brief  Configure DHT11 Pin as Output Open-Drain / Push-Pull for Start Signal
+  * @retval None
+  */
+static void DHT11_SetPin_Output(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  GPIO_InitStruct.Pin = DHT11_PIN;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(DHT11_PORT, &GPIO_InitStruct);
+}
+
+/**
+  * @brief  Configure DHT11 Pin as Input with Pull-Up for Data Reception
+  * @retval None
+  */
+static void DHT11_SetPin_Input(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  GPIO_InitStruct.Pin = DHT11_PIN;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(DHT11_PORT, &GPIO_InitStruct);
+}
+
+/**
+  * @brief  Read Temperature & Humidity from DHT11 using DWT Microsecond Pulse Timing
+  * @param  temperature: Pointer to store measured temperature (°C)
+  * @param  humidity: Pointer to store measured humidity (% RH)
+  * @retval DHT11_OK (0), DHT11_ERR_NO_RESPONSE (1), DHT11_ERR_CHECKSUM (2), DHT11_ERR_TIMEOUT (3)
+  */
+uint8_t DHT11_Read(float *temperature, float *humidity)
+{
+  uint8_t data[5] = {0, 0, 0, 0, 0};
+  uint32_t start_time;
+  const uint32_t timeout_ticks = 250 * (SystemCoreClock / 1000000U); /* 250 us timeout */
+
+  /* 1. Host Start Signal: Drive LOW for 18 ms */
+  DHT11_SetPin_Output();
+  HAL_GPIO_WritePin(DHT11_PORT, DHT11_PIN, GPIO_PIN_RESET);
+  HAL_Delay(18);
+
+  /* Disable interrupts during microsecond-critical handshake to avoid SysTick jitter */
+  __disable_irq();
+
+  /* 2. Pull HIGH for 30 us and switch to Input Mode with Pull-up */
+  HAL_GPIO_WritePin(DHT11_PORT, DHT11_PIN, GPIO_PIN_SET);
+  delay_us(30);
+  DHT11_SetPin_Input();
+
+  /* 3. Wait for DHT11 Response: Line pulled LOW by sensor */
+  start_time = DWT->CYCCNT;
+  while (HAL_GPIO_ReadPin(DHT11_PORT, DHT11_PIN) == GPIO_PIN_SET)
+  {
+    if ((DWT->CYCCNT - start_time) > timeout_ticks) {
+      __enable_irq();
+      return DHT11_ERR_NO_RESPONSE;
+    }
+  }
+
+  /* 4. Wait for DHT11 to release line HIGH (~80 us) */
+  start_time = DWT->CYCCNT;
+  while (HAL_GPIO_ReadPin(DHT11_PORT, DHT11_PIN) == GPIO_PIN_RESET)
+  {
+    if ((DWT->CYCCNT - start_time) > timeout_ticks) {
+      __enable_irq();
+      return DHT11_ERR_NO_RESPONSE;
+    }
+  }
+
+  /* 5. Wait for DHT11 to pull line LOW before transmitting bit 0 (~80 us) */
+  start_time = DWT->CYCCNT;
+  while (HAL_GPIO_ReadPin(DHT11_PORT, DHT11_PIN) == GPIO_PIN_SET)
+  {
+    if ((DWT->CYCCNT - start_time) > timeout_ticks) {
+      __enable_irq();
+      return DHT11_ERR_NO_RESPONSE;
+    }
+  }
+
+  /* 6. Read 40 Bits of Data */
+  for (int bit_idx = 0; bit_idx < 40; bit_idx++)
+  {
+    /* Wait for 50 us LOW period to finish (Line goes HIGH) */
+    start_time = DWT->CYCCNT;
+    while (HAL_GPIO_ReadPin(DHT11_PORT, DHT11_PIN) == GPIO_PIN_RESET)
+    {
+      if ((DWT->CYCCNT - start_time) > timeout_ticks) {
+        __enable_irq();
+        return DHT11_ERR_TIMEOUT;
+      }
+    }
+
+    /* Measure duration while line is HIGH */
+    start_time = DWT->CYCCNT;
+    while (HAL_GPIO_ReadPin(DHT11_PORT, DHT11_PIN) == GPIO_PIN_SET)
+    {
+      if ((DWT->CYCCNT - start_time) > timeout_ticks) {
+        __enable_irq();
+        return DHT11_ERR_TIMEOUT;
+      }
+    }
+    uint32_t high_duration_us = (DWT->CYCCNT - start_time) / (SystemCoreClock / 1000000U);
+
+    /* Bit '0' is ~26-28 us HIGH; Bit '1' is ~70 us HIGH. Threshold: 40 us */
+    if (high_duration_us > 40)
+    {
+      data[bit_idx / 8] |= (1U << (7 - (bit_idx % 8)));
+    }
+  }
+
+  /* Re-enable interrupts immediately after 40-bit reception */
+  __enable_irq();
+
+  /* 7. Validate 8-bit Checksum */
+  uint8_t checksum = (uint8_t)(data[0] + data[1] + data[2] + data[3]);
+  if (checksum != data[4] || checksum == 0)
+  {
+    return DHT11_ERR_CHECKSUM;
+  }
+
+  /* 8. Convert to Float Readings */
+  *humidity = (float)data[0] + ((float)data[1] * 0.1f);
+  *temperature = (float)data[2] + ((float)data[3] * 0.1f);
+
+  return DHT11_OK;
 }
 
 /**
@@ -436,6 +595,36 @@ void BMS_ProcessSensors(BMS_DualBattery_Data_t *bms)
       bms->power_watts = 0.0f;
     }
   }
+
+  /* 8. Process DHT11 Temperature & Humidity Sensor (PB0) - Sampled at 1.5s intervals */
+  static uint8_t dht_fail_count = 0;
+  static uint32_t s_last_dht_read_tick = 0;
+  uint32_t current_tick = HAL_GetTick();
+
+  if ((current_tick - s_last_dht_read_tick) >= 1500 || s_last_dht_read_tick == 0)
+  {
+    s_last_dht_read_tick = current_tick;
+    float temp_val = 0.0f;
+    float hum_val = 0.0f;
+    uint8_t dht_status = DHT11_Read(&temp_val, &hum_val);
+    bms->dht11_error_code = dht_status;
+
+    if (dht_status == DHT11_OK)
+    {
+      dht_fail_count = 0;
+      bms->dht11_connected = true;
+      bms->temperature_c = temp_val;
+      bms->humidity_pct = hum_val;
+    }
+    else
+    {
+      dht_fail_count++;
+      if (dht_fail_count > 3)
+      {
+        bms->dht11_connected = false;
+      }
+    }
+  }
 }
 
 /**
@@ -536,7 +725,7 @@ void BMS_PrintTelemetry(const BMS_DualBattery_Data_t *bms)
   snprintf(buffer, sizeof(buffer), " Cell Imbalance       : %s V\r\n", str_vimb);
   UART_SendString(buffer);
 
-  /* 6. ADDED: Current & Power from ACS712 (after Cell Imbalance) */
+  /* 6. Current & Power from ACS712 */
   if (bms->current_sensor_connected) {
     snprintf(buffer, sizeof(buffer), " Battery Current      : %s A [%s]\r\n", str_curr, bms->current_state);
     UART_SendString(buffer);
@@ -548,12 +737,29 @@ void BMS_PrintTelemetry(const BMS_DualBattery_Data_t *bms)
     UART_SendString(" Instantaneous Power  : 0.000 W [SENSOR DISCONNECTED]\r\n");
   }
 
-  /* 7. System Status (original format) */
+  /* 7. Ambient / Pack Temperature & Humidity from DHT11 (PB0) */
+  if (bms->dht11_connected) {
+    char str_temp[16], str_hum[16];
+    Format_Float(str_temp, sizeof(str_temp), bms->temperature_c, 1);
+    Format_Float(str_hum, sizeof(str_hum), bms->humidity_pct, 1);
+    snprintf(buffer, sizeof(buffer), " Temperature / Hum   : %s deg C | %s %% RH [DHT11 OK]\r\n", str_temp, str_hum);
+  } else {
+    if (bms->dht11_error_code == DHT11_ERR_CHECKSUM) {
+      snprintf(buffer, sizeof(buffer), " Temperature / Hum   : --.- deg C | --.- %% RH [CHECKSUM ERROR]\r\n");
+    } else {
+      snprintf(buffer, sizeof(buffer), " Temperature / Hum   : --.- deg C | --.- %% RH [SENSOR DISCONNECTED]\r\n");
+    }
+  }
+  UART_SendString(buffer);
+
+  /* 8. System Status */
   UART_SendString(" System Status        : ");
   if (!bms->bat1_connected && !bms->pack_connected) {
     UART_SendString("[i] IDLE - NO BATTERIES CONNECTED (0.00V)\r\n");
   } else if (bms->adc1_saturated) {
     UART_SendString("[!] WARNING: PA1 (PACK) SATURATED (>23.74V)!\r\n");
+  } else if (bms->dht11_connected && bms->temperature_c > TEMP_MAX_LIMIT) {
+    UART_SendString("[!] WARNING: OVERTEMPERATURE DETECTED!\r\n");
   } else if (bms->v_bat1 > BAT1_MAX_LIMIT || bms->v_pack > PACK_MAX_LIMIT) {
     UART_SendString("[!] WARNING: OVERVOLTAGE DETECTED!\r\n");
   } else {
