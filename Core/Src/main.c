@@ -490,6 +490,8 @@ void BMS_PrintTelemetry(const BMS_DualBattery_Data_t *bms)
   } else {
     UART_SendString("[OK] NORMAL - ALL VOLTAGES WITHIN RANGE\r\n");
   }
+  UART_SendString("--------------------------------------------------------------------\r\n\r\n");
+}
 
 /**
   * @brief  Helper to transmit a null-terminated string over USART2
